@@ -35,6 +35,7 @@ MODEL_SCORE_THRESHOLDS = {
     "google/gemma-2-27b-it": 0.91,
 }
 
+# Models with safetensor weights specifically quantized for Nvidia FP8 type (torch.float8_e4m3fn)
 nv_quantized_models = {
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
     "neuralmagic/gemma-2-2b-it-FP8",
@@ -47,16 +48,16 @@ def remove_nv_quantized_models(model_str):
     return ",".join(filtered)
 
 
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_failing_models(
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_nv_quantized_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
 )
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_nv_quantized_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
 )
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = remove_failing_models(
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = remove_nv_quantized_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1
 )
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_nv_quantized_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2
 )
 
