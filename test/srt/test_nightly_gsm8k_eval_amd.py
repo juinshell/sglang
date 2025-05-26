@@ -32,16 +32,16 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.86,
     "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.63,
+    "google/gemma-2-27b-it": 0.91,
 }
 
-failing_models = {
-    "google/gemma-2-27b-it",
+nv_quantized_models = {
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
     "neuralmagic/gemma-2-2b-it-FP8",
 }
 
 
-def remove_failing_models(model_str):
+def remove_nv_quantized_models(model_str):
     models = model_str.split(",")
     filtered = [m for m in models if m not in failing_models]
     return ",".join(filtered)
