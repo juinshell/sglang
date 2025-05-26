@@ -44,7 +44,7 @@ nv_quantized_models = {
 
 def remove_nv_quantized_models(model_str):
     models = model_str.split(",")
-    filtered = [m for m in models if m not in failing_models]
+    filtered = [m for m in models if m not in nv_quantized_models]
     return ",".join(filtered)
 
 
