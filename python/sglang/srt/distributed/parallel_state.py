@@ -224,6 +224,7 @@ class GroupCoordinator:
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
+            logger.info(f"[GroupCoordinator](init) ranks: {ranks}")
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
             if self.rank in ranks:
                 self.ranks = ranks

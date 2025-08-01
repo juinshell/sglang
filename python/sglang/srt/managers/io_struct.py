@@ -937,3 +937,22 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+# @dataclass
+# class ScalingReqInput:
+#     is_up: bool
+
+
+@dataclass
+class ScaleUpDpGroupReq:
+    pass
+
+@dataclass
+class CacheAwarePrefixLenReqInput:
+    token_ids: List[int]
+    
+@dataclass
+class CacheAwarePrefixLenReqOutput:
+    prefix_len: int
+    

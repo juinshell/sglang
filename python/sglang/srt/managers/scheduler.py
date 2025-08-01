@@ -90,6 +90,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    CacheAwarePrefixLenReqInput,
+    CacheAwarePrefixLenReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -116,7 +118,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.reasoning_parser import ReasoningParser
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, ScalingArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
@@ -133,6 +135,9 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+import multiprocessing as mp
+from multiprocessing.connection import Connection
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -172,11 +177,12 @@ class Scheduler(
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        scaling_args: Optional[ScalingArgs] = None
     ):
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
-        self.tp_size = server_args.tp_size
+        self.tp_size = scaling_args.tp_size if scaling_args is not None else server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
@@ -192,7 +198,7 @@ class Scheduler(
         self.page_size = server_args.page_size
 
         # Distributed rank info
-        self.dp_size = server_args.dp_size
+        self.dp_size = scaling_args.dp_size if scaling_args is not None else server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.dp_rank = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
@@ -207,6 +213,9 @@ class Scheduler(
         if self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            )
+            self.send_to_dp_controller = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_output_ipc_name, False
             )
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
@@ -261,8 +270,8 @@ class Scheduler(
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
             gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            dp_rank=dp_rank,
+            tp_rank=self.tp_rank,
+            dp_rank=self.dp_rank,
             nccl_port=port_args.nccl_port,
         )
 
@@ -422,6 +431,7 @@ class Scheduler(
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
+                (CacheAwarePrefixLenReqInput, self.send_prefix_len),
             ]
         )
 
@@ -729,6 +739,26 @@ class Scheduler(
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
+
+    def send_prefix_len(
+        self,
+        recv_req: CacheAwarePrefixLenReqInput,
+    ):
+        """Send the prefix length to the dp controller."""
+        seq_token_ids = recv_req.token_ids
+        if self.enable_hierarchical_cache:
+            value, _ = self.tree_cache.match_prefix(
+                key=seq_token_ids, include_evicted=False
+            )
+        else:
+            value, _ = self.tree_cache.match_prefix(key=seq_token_ids)
+
+        prefix_len = value.shape[0]
+        output = CacheAwarePrefixLenReqOutput(
+            prefix_len=prefix_len,
+        )
+        assert self.send_to_dp_controller is not None
+        self.send_to_dp_controller.send_pyobj(output)
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
@@ -1982,6 +2012,7 @@ def run_scheduler_process(
     tp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    scaling_args: Optional[ScalingArgs] = None,
 ):
     # Generate the prefix
     if dp_rank is None:
@@ -2009,7 +2040,14 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(
+            server_args,
+            port_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            scaling_args
+        )
         pipe_writer.send(
             {
                 "status": "ready",

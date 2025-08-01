@@ -114,6 +114,7 @@ class ServerArgs:
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
+    gpus_per_node: Optional[int] = None
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
@@ -196,6 +197,9 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: Optional[str] = None
+    
+    # random weight
+    
 
     def __post_init__(self):
         # Expert parallelism
@@ -763,6 +767,7 @@ class ServerArgs:
             choices=[
                 "round_robin",
                 "shortest_queue",
+                "cache_aware"
             ],
         )
 
@@ -787,6 +792,9 @@ class ServerArgs:
         )
         parser.add_argument(
             "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+        )
+        parser.add_argument(
+            "--gpus-per-node", type=int, help="The max number of GPUs per node."
         )
 
         # Model override args
@@ -1272,6 +1280,8 @@ class PortArgs:
     tokenizer_ipc_name: str
     # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
     scheduler_input_ipc_name: str
+    # The ipc filename for scheduler to send the prefix length to dp controller (zmq)
+    scheduler_output_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
 
@@ -1297,6 +1307,7 @@ class PortArgs:
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                scheduler_output_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -1318,15 +1329,28 @@ class PortArgs:
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
             if dp_rank is None:
+                # TokenizerManager <=> DataParallelController
+                # Note: this is called "scheduler_input_ipc", but actually is used for dp controller receiving requests from tokenizer.
                 scheduler_input_port = (
                     port_base + 3
-                )  # TokenizerManager to DataParallelController
+                )
+                # This is not used. Just for compatibility since every scheduler has an scheduler_output_port for sending prefix length to dp controller.
+                scheduler_output_port = (
+                    port_base + 4
+                )
+                
             else:
-                scheduler_input_port = port_base + 3 + 1 + dp_rank
+                # DataParallelController <=> Scheduler
+                # This is for dp controller dispatching requests to the scheduler.
+                scheduler_input_port = port_base + 4 + 1 + dp_rank
+                # This is for dp controller receiving prefix length from the scheduler.
+                scheduler_output_port = port_base + 4 + 1 + server_args.dp_size + dp_rank
+                
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
+                scheduler_output_ipc_name=f"tcp://{dist_init_host}:{scheduler_output_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
@@ -1379,3 +1403,10 @@ def auto_choose_speculative_params(self: ServerArgs):
     else:
         # The default value for all other models
         return (5, 4, 8)
+
+@dataclasses.dataclass
+class ScalingArgs:
+    dp_size: int # after scaling, whole dp group size
+    tp_size: int # after scaling, gpus whole num
+    tp_rank: int 
+    dp_rank: int

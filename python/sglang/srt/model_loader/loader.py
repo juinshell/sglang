@@ -373,7 +373,7 @@ class DefaultModelLoader(BaseModelLoader):
                     model_config,
                     self.load_config,
                 )
-
+            
             model.load_weights(self._get_all_weights(model_config, model))
 
             for _, module in model.named_modules():

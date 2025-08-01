@@ -62,6 +62,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
+    ScaleUpDpGroupReq
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -226,6 +227,11 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
 
+# [moe-scaling] scale up dp group
+@app.api_route("/scale_up_dp_group", methods=["POST", "PUT"])
+async def scale_up_dp_group(obj: ScaleUpDpGroupReq, request: Request):
+    res = await _global_state.tokenizer_manager.scale_up_dp_group(obj)
+    return res
 
 # fastapi implicitly converts json in the request to obj (dataclass)
 @app.api_route("/generate", methods=["POST", "PUT"])

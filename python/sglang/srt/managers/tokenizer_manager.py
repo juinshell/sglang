@@ -94,6 +94,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    ScaleUpDpGroupReq,
 )
 from sglang.srt.managers.multimodal_processor import (
     get_dummy_processor,
@@ -904,6 +905,10 @@ class TokenizerManager:
             await self.get_internal_state_communicator(req)
         )
         return res[0].internal_state
+    
+    async def scale_up_dp_group(self, obj: ScaleUpDpGroupReq):
+        await self.send_to_scheduler.send_pyobj(obj)
+        
 
     def get_log_request_metadata(self):
         max_length = None
