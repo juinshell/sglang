@@ -35,6 +35,9 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
+from sglang.srt.distributed import (
+    get_tp_group
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.disaggregation.decode import (
@@ -90,8 +93,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    CacheAwarePrefixLenReqInput,
-    CacheAwarePrefixLenReqOutput,
+    CacheAwareInfoInput,
+    CacheAwareInfoOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -177,7 +180,7 @@ class Scheduler(
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
-        scaling_args: Optional[ScalingArgs] = None
+        scaling_args: Optional[ScalingArgs] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -431,7 +434,7 @@ class Scheduler(
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
-                (CacheAwarePrefixLenReqInput, self.send_prefix_len),
+                (CacheAwareInfoInput, self.send_cache_aware_info),
             ]
         )
 
@@ -629,6 +632,9 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
+            # update self.tp_cpu_group
+            self.tp_cpu_group = get_tp_group().cpu_group
+
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -740,9 +746,9 @@ class Scheduler(
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
 
-    def send_prefix_len(
+    def send_cache_aware_info(
         self,
-        recv_req: CacheAwarePrefixLenReqInput,
+        recv_req: CacheAwareInfoInput,
     ):
         """Send the prefix length to the dp controller."""
         seq_token_ids = recv_req.token_ids
@@ -754,8 +760,13 @@ class Scheduler(
             value, _ = self.tree_cache.match_prefix(key=seq_token_ids)
 
         prefix_len = value.shape[0]
-        output = CacheAwarePrefixLenReqOutput(
+        
+        running_req_num = len(self.waiting_queue) + (self.running_batch.batch_size() if self.running_batch else 0)
+        
+        output = CacheAwareInfoOutput(
             prefix_len=prefix_len,
+            running_req_num=running_req_num,
+            available_size=self.token_to_kv_pool_allocator.available_size()
         )
         assert self.send_to_dp_controller is not None
         self.send_to_dp_controller.send_pyobj(output)

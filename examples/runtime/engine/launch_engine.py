@@ -6,8 +6,8 @@ import sglang as sgl
 
 
 def main():
-    llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
-    llm.generate("What is the capital of France?")
+    llm = sgl.Engine(model_path="/tmp/models/Llama-3.2-8B-Instruct")
+    print(llm.generate("how to train an LLM?"))
     llm.shutdown()
 
 

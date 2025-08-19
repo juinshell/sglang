@@ -32,6 +32,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
+    initialize_scaling_group,
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
@@ -324,7 +325,7 @@ class ModelRunner:
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
 
-    def init_torch_distributed(self):
+    def init_torch_distributed(self, scaling_up: bool = False):
         logger.info("Init torch distributed begin.")
 
         try:
@@ -371,6 +372,8 @@ class ModelRunner:
                 tp_size=self.tp_size,
                 dp_size=self.server_args.dp_size,
             )
+            if self.server_args.enable_scaling:
+                initialize_scaling_group()
 
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
@@ -1019,6 +1022,9 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
+        # [moe-scaling] before forward, update tp group
+        if self.server_args.enable_scaling:
+            self.tp_group = get_tp_group()
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner

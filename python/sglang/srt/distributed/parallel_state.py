@@ -971,9 +971,47 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 
+_ENABLE_SCALING = False
+_TP_GROUPS: Dict[int, GroupCoordinator] = {}
+_CUR_RANGE = 0
+
+def initialize_scaling_group():
+    logger.info(f"init_scaling_group: begin")
+    # avoid circular import
+    from sglang.srt.layers.dp_attention import get_attention_dp_size, get_attention_tp_size
+    global _ENABLE_SCALING, _CUR_RANGE
+    _ENABLE_SCALING = True
+    _CUR_RANGE = 0
+    # for each scaling range, init a tp group
+    for i in range(get_attention_dp_size()):
+        if get_world_group().local_rank < get_attention_tp_size() * (i + 1):
+            _TP_GROUPS[i] = None
+            continue
+        logger.info(f"init_scaling_group: init tp group for dp_group[0] - dp_group[{i}], size: {get_attention_tp_size() * (i + 1)}")
+        group_ranks = [list(range(0, (i + 1) * get_attention_tp_size()))]
+        local_rank = get_world_group().local_rank
+        _TP_GROUPS[i] = init_model_parallel_group(
+            group_ranks=group_ranks,
+            local_rank=local_rank,
+            backend=torch.distributed.get_backend(get_world_group().device_group),
+            use_message_queue_broadcaster=True,
+            group_name=f"tp_{i}",
+        )
+    logger.info(f"init_scaling_group: end")
+    
+def update_cur_range(range: int):
+    global _CUR_RANGE
+    _CUR_RANGE = range
+    # sync in world
+    get_world_group().barrier()
 
 def get_tp_group() -> GroupCoordinator:
+    from sglang.srt.layers.dp_attention import get_attention_dp_size
     assert _TP is not None, "tensor model parallel group is not initialized"
+    if _ENABLE_SCALING:
+        assert _CUR_RANGE < get_attention_dp_size(), f"range {_CUR_RANGE} is out of range"
+        assert _TP_GROUPS[_CUR_RANGE] is not None, f"tp group for dp_group[0] - dp_group[{_CUR_RANGE}] is not initialized"
+        return _TP_GROUPS[_CUR_RANGE]
     return _TP
 
 
@@ -1048,7 +1086,7 @@ def init_distributed_environment(
             assert isinstance(timeout, (int)), "timeout must be a number"
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
-
+        
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
@@ -1128,6 +1166,7 @@ def initialize_model_parallel(
         )
         group_ranks.append(ranks)
 
+    logger.info(f"init_model_parallel_group: group_ranks: {group_ranks}")
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,
@@ -1140,7 +1179,7 @@ def initialize_model_parallel(
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
+    # assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = []
     for i in range(num_pipeline_model_parallel_groups):
         ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))

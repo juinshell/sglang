@@ -19,6 +19,8 @@ import signal
 import threading
 from enum import Enum, auto
 
+from networkx import min_cost_flow
+
 import psutil
 import setproctitle
 import zmq
@@ -31,8 +33,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     ScaleUpDpGroupReq,
-    CacheAwarePrefixLenReqInput,
-    CacheAwarePrefixLenReqOutput,
+    CacheAwareInfoInput,
+    CacheAwareInfoOutput,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -43,6 +45,12 @@ from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+log_path = "/workspace/moe-scaling/log"
+import os
+os.makedirs(os.path.dirname(log_path), exist_ok=True)
+file_handler = logging.FileHandler(log_path, encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+logger.addHandler(file_handler)
 
 class LoadBalanceMethod(Enum):
     """Load balance method."""
@@ -93,18 +101,27 @@ class DataParallelController:
         self.workers = [None] * server_args.dp_size
         # [cache-aware scheduler]
         self.cache_aware_receivers = [None] * server_args.dp_size
-        
+
         # [moe-scaling]
         self.cur_gpus = 0
-        self.cur_dp_size = server_args.dp_size
+        self.cur_dp_size = 0
         self.workers_per_dp = server_args.tp_size // server_args.dp_size
-        
+        self.dp_groups_flag = [
+            False
+        ] * server_args.dp_size  # at beginning, only first dp group is serving
+
         if server_args.enable_dp_attention:
             dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
             self.control_message_step = server_args.tp_size
+            self.cur_gpus = self.workers_per_dp
+            self.cur_dp_size = 1
+            self.dp_groups_flag[0] = True
         else:
             dp_port_args = self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
+
+        if not self.server_args.enable_scaling:
+            self.dp_groups_flag = [True] * server_args.dp_size
 
         # Only node rank 0 runs the real data parallel controller that dispatches the requests.
         if server_args.node_rank == 0:
@@ -180,26 +197,11 @@ class DataParallelController:
             pass
 
     def scaling_up_intra_node_dp_group(self, req: ScaleUpDpGroupReq):
-        self.launch_tensor_parallel_group(
-            self.server_args,
-            self.port_args,
-            0,
-            None,
-            scaling=True,
-        )
-        dp_port_arg = PortArgs.init_new(self.server_args, self.server_args.dp_size)
-        # Only node rank 0 runs the real data parallel controller that dispatches the requests.
-        if self.server_args.node_rank == 0:
-            self.workers.append(
-                get_zmq_socket(
-                    self.context,
-                    zmq.PUSH,
-                    dp_port_arg.scheduler_input_ipc_name,
-                    True,
-                )
-            )
+        # assume initally, we can see all gpus, but only one dp group can serve
+        self.dp_groups_flag[self.cur_dp_size] = True
         # done scaling up
         self.cur_dp_size += 1
+        self.cur_gpus += self.workers_per_dp
         logger.info(f"Scaling up DP group to {self.cur_dp_size} numbers.")
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
@@ -231,32 +233,24 @@ class DataParallelController:
             tp_size_per_node * server_args.node_rank,
             tp_size_per_node * (server_args.node_rank + 1),
         )
-        if scaling is True:
-            # tp_size is the minimum scaling unit
-            tp_size_per_node = min(
-                (server_args.tp_size + self.cur_gpus), server_args.gpus_per_node
-            )
-            tp_rank_range = range(self.cur_gpus, self.cur_gpus + server_args.tp_size)
+        # if scaling is True:
+        #     # tp_size is the minimum scaling unit
+        #     tp_size_per_node = min(
+        #         (server_args.tp_size + self.cur_gpus), server_args.gpus_per_node
+        #     )
+        #     tp_rank_range = range(self.cur_gpus, self.cur_gpus + server_args.tp_size)
 
         for tp_rank in tp_rank_range:
             rank_port_args = port_args
 
             if server_args.enable_dp_attention:
                 # dp attention has different sharding logic
-                _, _, dp_rank = compute_dp_attention_world_info(
+                attn_tp_rank, _, dp_rank = compute_dp_attention_world_info(
                     server_args.enable_dp_attention,
                     tp_rank,
                     server_args.tp_size,
                     server_args.dp_size,
                 )
-                if scaling is True:
-                    logger.info(f"[compute_dp_attention_world_info] tp_rank: {tp_rank}, (tp_size + cur_gpus): {server_args.tp_size + self.cur_gpus}, dp_size + cur_dp_size: {server_args.dp_size + self.cur_dp_size}")
-                    _, _, dp_rank = compute_dp_attention_world_info(
-                        server_args.enable_dp_attention,
-                        tp_rank,
-                        server_args.tp_size + self.cur_gpus,
-                        server_args.dp_size + self.cur_dp_size,
-                    )
                 # compute zmq ports for this dp rank
                 rank_port_args = PortArgs.init_new(server_args, dp_rank)
                 # Data parallelism resues the tensor parallelism group,
@@ -264,15 +258,15 @@ class DataParallelController:
                 rank_port_args.nccl_port = port_args.nccl_port
 
             reader, writer = mp.Pipe(duplex=False)
-            
-            logger.info(f"base_gpu_id: {base_gpu_id}, tp_rank: {tp_rank}, tp_size_per_node: {tp_size_per_node}, ")
             gpu_id = (
                 server_args.base_gpu_id
                 + base_gpu_id
                 + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
             )
 
-            logger.info(f"Launching scheduler for DP{dp_rank} starting at GPU #{gpu_id}.")
+            logger.info(
+                f"Launching scheduler for DP{dp_rank}-TP{attn_tp_rank} starting at GPU #{gpu_id}."
+            )
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, rank_port_args, gpu_id, tp_rank, dp_rank, writer),
@@ -282,10 +276,6 @@ class DataParallelController:
             self.scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
 
-
-
-        # [moe-scaling]
-        self.cur_gpus += server_args.tp_size
         # Wait for model to finish loading
         scheduler_info = []
         for i in range(len(scheduler_pipe_readers)):
@@ -295,54 +285,94 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def round_robin_scheduler(self, req: Req):
-        if self.server_args.disaggregation_mode == "null":
+        if (
+            self.server_args.disaggregation_mode == "null"
+            and not self.server_args.enable_scaling
+        ):
             self.workers[self.round_robin_counter].send_pyobj(req)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
             )
+        elif self.server_args.enable_scaling:
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % self.cur_dp_size
         else:
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
         raise NotImplementedError()
 
-    def cache_aware_scheduler(self, req: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput):
+    def cache_aware_scheduler(
+        self, req: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput
+    ):
+        # logger.info(f"Cache-aware scheduler: dp_groups_flags:{self.dp_groups_flag}")
         # choose the worker with LPM prefix match
         max_prefix_len = 0
         max_prefix_idx = 0
-        
+        max_workload = 0
+        # max_workload_idx = 0
+        min_workload = 2**31 - 1
+        min_workload_idx = 0
+        max_available_size = 0
+        max_available_size_idx = 0
+
         for i in range(len(self.workers)):
-            self.workers[i].send_pyobj(
-                CacheAwarePrefixLenReqInput(token_ids=req.input_ids)
-            )
-        
+            if self.dp_groups_flag[i]:
+                self.workers[i].send_pyobj(CacheAwareInfoInput(token_ids=req.input_ids))
+
         # receive the prefix length from each scheduler
         received_cnt = 0
         received_len = [-1] * len(self.workers)
-        while received_cnt < len(self.workers):
+        received_workload = [-1] * len(self.workers)
+        received_available_size = [-1] * len(self.workers)
+        while received_cnt < sum(self.dp_groups_flag):
             for i in range(len(self.workers)):
-                if received_len[i] == -1:
+                if received_len[i] == -1 and self.dp_groups_flag[i]:
                     try:
-                        recv_prefix_len_obj = self.cache_aware_receivers[i].recv_pyobj(zmq.NOBLOCK)
-                        prefix_len = recv_prefix_len_obj.prefix_len
+                        recv_info_obj: CacheAwareInfoOutput = (
+                            self.cache_aware_receivers[i].recv_pyobj(zmq.NOBLOCK)
+                        )
+                        prefix_len = recv_info_obj.prefix_len
                         received_len[i] = prefix_len
+                        workload = recv_info_obj.running_req_num
+                        received_workload[i] = workload
+                        available_size = recv_info_obj.available_size
+                        received_available_size[i] = available_size
+
                         received_cnt += 1
                         if prefix_len > max_prefix_len:
                             max_prefix_len = prefix_len
                             max_prefix_idx = i
+                        if workload > max_workload:
+                            max_workload = workload
+                            # max_workload_idx = i
+                        if workload < min_workload:
+                            min_workload = workload
+                            min_workload_idx = i
+                        if available_size > max_available_size:
+                            max_available_size = available_size
+                            max_available_size_idx = i
+
                     except zmq.ZMQError:
                         continue
-        
+
+        ratio = max_prefix_len / len(req.input_ids)
         logger.info(
-            f"Cache-aware scheduler: req.input_ids: {req.input_ids[:20]}, received_len: {received_len}, max_prefix_len: {max_prefix_len}, max_prefix_idx: {max_prefix_idx}"
+            f"Cache-aware scheduler: received_len: {received_len}, max_prefix_idx: {max_prefix_idx}, received_workload: {received_workload}, min_workload_idx: {min_workload_idx}, received_available_size: {received_available_size}, ratio: {ratio:.4f}"
         )
-        
-        if max_prefix_len == 0:
-            # no prefix match, use round robin
-            self.round_robin_scheduler(req)
+
+        # load balance logic
+        if max_workload - min_workload >= 32 or max_workload > 1.0001 * min_workload:
+            # unbalance, send to the least loaded worker
+            self.workers[min_workload_idx].send_pyobj(req)
             return
 
-        self.workers[max_prefix_idx].send_pyobj(req)
+        # balance
+
+        if ratio >= 0.3:
+            self.workers[max_prefix_idx].send_pyobj(req)
+        else:
+            self.workers[max_available_size_idx].send_pyobj(req)
 
     def event_loop(self):
         while True:
@@ -364,7 +394,6 @@ class DataParallelController:
                 elif isinstance(recv_req, ScaleUpDpGroupReq):
                     # scaling up dp group
                     self.scaling_up_intra_node_dp_group(recv_req)
-
                 else:
                     # Send other control messages to first worker of tp group
                     for worker in self.workers[:: self.control_message_step]:

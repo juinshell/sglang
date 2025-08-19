@@ -948,11 +948,19 @@ class RpcReqOutput:
 class ScaleUpDpGroupReq:
     pass
 
+
 @dataclass
-class CacheAwarePrefixLenReqInput:
+class CacheAwareInfoInput:
     token_ids: List[int]
-    
+
+
 @dataclass
-class CacheAwarePrefixLenReqOutput:
+class CacheAwareInfoOutput:
     prefix_len: int
-    
+    running_req_num: int
+    available_size: int
+
+
+@dataclass
+class CacheAwareReqFinishMsg:
+    finished_rids: List[str]

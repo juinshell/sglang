@@ -158,6 +158,8 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    # [moe-scaling] enable scaling up dp group
+    enable_scaling: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
@@ -1002,6 +1004,11 @@ class ServerArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+        )
+        parser.add_argument(
+            "--enable-scaling",
+            action="store_true",
+            help="Enabling scaling dp group.",
         )
         parser.add_argument(
             "--enable-ep-moe",
