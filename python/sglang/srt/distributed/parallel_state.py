@@ -233,6 +233,9 @@ class GroupCoordinator:
                 self.device_group = device_group
                 self.cpu_group = cpu_group
 
+        if self.device_group is None or self.cpu_group is None:
+            return 
+        
         assert self.cpu_group is not None
         assert self.device_group is not None
 
@@ -981,12 +984,12 @@ def initialize_scaling_group():
     from sglang.srt.layers.dp_attention import get_attention_dp_size, get_attention_tp_size
     global _ENABLE_SCALING, _CUR_RANGE
     _ENABLE_SCALING = True
-    _CUR_RANGE = 0
+    _CUR_RANGE = get_attention_dp_size() - 1
     # for each scaling range, init a tp group
     for i in range(get_attention_dp_size()):
-        if get_world_group().local_rank < get_attention_tp_size() * (i + 1):
-            _TP_GROUPS[i] = None
-            continue
+        # if get_world_group().local_rank < get_attention_tp_size() * (i + 1):
+        #     _TP_GROUPS[i] = None
+        #     continue
         logger.info(f"init_scaling_group: init tp group for dp_group[0] - dp_group[{i}], size: {get_attention_tp_size() * (i + 1)}")
         group_ranks = [list(range(0, (i + 1) * get_attention_tp_size()))]
         local_rank = get_world_group().local_rank
@@ -1005,10 +1008,14 @@ def update_cur_range(range: int):
     # sync in world
     get_world_group().barrier()
 
-def get_tp_group() -> GroupCoordinator:
+def get_tp_group(range: Optional[int] = None) -> GroupCoordinator:
     from sglang.srt.layers.dp_attention import get_attention_dp_size
     assert _TP is not None, "tensor model parallel group is not initialized"
     if _ENABLE_SCALING:
+        if range is not None:
+            assert range < get_attention_dp_size(), f"range {range} is out of range"
+            assert _TP_GROUPS[range] is not None, f"tp group for dp_group[0] - dp_group[{range}] is not initialized"
+            return _TP_GROUPS[range]
         assert _CUR_RANGE < get_attention_dp_size(), f"range {_CUR_RANGE} is out of range"
         assert _TP_GROUPS[_CUR_RANGE] is not None, f"tp group for dp_group[0] - dp_group[{_CUR_RANGE}] is not initialized"
         return _TP_GROUPS[_CUR_RANGE]

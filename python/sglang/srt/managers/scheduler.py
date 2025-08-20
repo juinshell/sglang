@@ -36,7 +36,8 @@ from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.distributed import (
-    get_tp_group
+    get_tp_group,
+    update_cur_range
 )
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
@@ -93,6 +94,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    ScaleDownDpGroupReqInput,
+    UpdateCurRangeReqInput,
     CacheAwareInfoInput,
     CacheAwareInfoOutput,
 )
@@ -136,6 +139,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
+    get_available_gpu_memory
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -165,6 +169,12 @@ class EmbeddingBatchResult:
     embeddings: torch.Tensor
     bid: int
 
+# enum status
+from enum import Enum, auto
+
+class ScalingStatus(Enum):
+    SERVING = auto()
+    DOWN = auto()
 
 class Scheduler(
     SchedulerOutputProcessorMixin,
@@ -202,6 +212,7 @@ class Scheduler(
 
         # Distributed rank info
         self.dp_size = scaling_args.dp_size if scaling_args is not None else server_args.dp_size
+        self.cur_dp_size = self.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.dp_rank = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
@@ -435,6 +446,8 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (CacheAwareInfoInput, self.send_cache_aware_info),
+                # (ScaleDownDpGroupReqInput, self.scale_down),
+                (UpdateCurRangeReqInput, self.update_cur_range),
             ]
         )
 
@@ -442,6 +455,8 @@ class Scheduler(
             self.server_args.disaggregation_mode
         )
         self.init_disaggregation()
+        
+        self.scaling_status = ScalingStatus.SERVING
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -630,15 +645,24 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             recv_reqs = self.recv_requests()
+            if len(recv_reqs) > 0:
+                logger.debug(
+                    f"Received {len(recv_reqs)} requests at tp_rank {self.tp_rank}"
+                    # show the type of requests
+                    f" with types {[type(req).__name__ for req in recv_reqs]}"
+                )
             self.process_input_requests(recv_reqs)
 
-            # update self.tp_cpu_group
+            # [moe-scaling]update self.tp_cpu_group
             self.tp_cpu_group = get_tp_group().cpu_group
-
+            
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             if batch:
+                logger.info(
+                    f"Running with tp_group name: {get_tp_group().unique_name}"
+                )
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -696,6 +720,9 @@ class Scheduler(
             while True:
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    logger.info(
+                        f"Received request type {type(recv_req).__name__} at tp_rank {self.tp_rank}"
+                    )
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
@@ -708,6 +735,7 @@ class Scheduler(
                 recv_reqs.append(recv_rpc)
         else:
             recv_reqs = None
+        
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
@@ -737,10 +765,20 @@ class Scheduler(
                     self.attn_tp_cpu_group,
                     src=attn_tp_rank_0,
                 )
+                if len(work_reqs) > 0:
+                    logger.debug(
+                        f"Broadcasted work requests(num={len(work_reqs)}) from tp_rank {attn_tp_rank_0}"
+                    )
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
-                    control_reqs, self.tp_rank, self.tp_cpu_group
+                    control_reqs, self.tp_rank, 
+                    #self.tp_cpu_group
+                    get_tp_group(self.server_args.dp_size - 1).cpu_group, # PP not impl and consider currently. control req send to all worker
                 )
+                if len(control_reqs) > 0:
+                    logger.debug(
+                        f"Broadcasted control requests(num={len(control_reqs)}) from tp_rank {self.tp_rank}"
+                    )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
@@ -779,7 +817,10 @@ class Scheduler(
             ):
                 self.return_health_check_ct += 1
                 continue
-
+            
+            logger.debug(
+                f"Processing request type {type(recv_req).__name__} at tp_rank {self.tp_rank}"
+            )
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if isinstance(output, RpcReqOutput):
@@ -1206,10 +1247,12 @@ class Scheduler(
             else:
                 ret = None
 
+        # logger.debug(f"before handle dp attn ret: {ret.batch_size() if ret else 'None'}")
         # Handle DP attention
-        if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
+        if self.scaling_status == ScalingStatus.SERVING and (self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm):
             ret, _ = self.prepare_dp_attn_batch(ret)
-
+        
+        # logger.debug(f"after handle dp attn ret: {ret.batch_size() if ret else 'None'}")
         return ret
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -1485,7 +1528,8 @@ class Scheduler(
     def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
         return self.prepare_dp_attn_batch_raw(
             local_batch,
-            dp_size=self.server_args.dp_size,
+            # dp_size=self.server_args.dp_size,
+            dp_size=self.cur_dp_size,
             attn_tp_size=self.attn_tp_size,
             tp_cpu_group=self.tp_cpu_group,
             get_idle_batch=self.get_idle_batch,
@@ -1561,7 +1605,12 @@ class Scheduler(
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
+        
+        _global_num_tokens = global_info[:, :, 0].tolist()
 
+        if max(global_num_tokens) > 0:
+            logger.debug(f"local num_tokens={num_tokens}, _global_num_tokens={_global_num_tokens}")
+            
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
 
@@ -1843,6 +1892,9 @@ class Scheduler(
         )
         self.memory_saver_adapter.pause()
         self.flush_cache()
+        logger.info(
+            "Memory occupation released. "
+        )
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
@@ -1996,6 +2048,29 @@ class Scheduler(
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
         else:
             del self.sessions[session_id]
+    
+    def update_cur_range(self, recv_req: UpdateCurRangeReqInput):
+        """Update the current range of the DP group."""
+        logger.info(
+            f"Update cur_range for tp_rank {self.tp_rank} with cur_range: {recv_req.cur_range}, flag: {recv_req.cur_worker_running_flag}"
+        )
+        update_cur_range(recv_req.cur_range)
+        self.cur_dp_size = recv_req.cur_range + 1
+        self.tp_cpu_group = get_tp_group().cpu_group # [jxdeng] may be None!
+        if not recv_req.cur_worker_running_flag[self.tp_rank]:
+            self.release_memory()
+    
+    def release_memory(self):
+        """Clear model and kv cache."""
+        self.scaling_status = ScalingStatus.DOWN
+        # check mem before
+        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        self.release_memory_occupation(ReleaseMemoryOccupationReqInput())
+        after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"GPU {self.gpu_id} model clear, saved memory={(after_avail_memory - before_avail_memory):.2f} GB, avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+        
 
 
 def is_health_check_generate_req(recv_req):

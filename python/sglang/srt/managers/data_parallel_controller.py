@@ -32,9 +32,11 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    ScaleUpDpGroupReq,
+    ScaleDpGroupReq,
     CacheAwareInfoInput,
     CacheAwareInfoOutput,
+    ScaleDownDpGroupReqInput,
+    UpdateCurRangeReqInput
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -103,25 +105,19 @@ class DataParallelController:
         self.cache_aware_receivers = [None] * server_args.dp_size
 
         # [moe-scaling]
-        self.cur_gpus = 0
-        self.cur_dp_size = 0
+        self.cur_gpus = self.server_args.tp_size
+        self.cur_dp_size = server_args.dp_size
         self.workers_per_dp = server_args.tp_size // server_args.dp_size
         self.dp_groups_flag = [
-            False
+            True
         ] * server_args.dp_size  # at beginning, only first dp group is serving
 
         if server_args.enable_dp_attention:
             dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
             self.control_message_step = server_args.tp_size
-            self.cur_gpus = self.workers_per_dp
-            self.cur_dp_size = 1
-            self.dp_groups_flag[0] = True
         else:
             dp_port_args = self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
-
-        if not self.server_args.enable_scaling:
-            self.dp_groups_flag = [True] * server_args.dp_size
 
         # Only node rank 0 runs the real data parallel controller that dispatches the requests.
         if server_args.node_rank == 0:
@@ -196,13 +192,28 @@ class DataParallelController:
         while True:
             pass
 
-    def scaling_up_intra_node_dp_group(self, req: ScaleUpDpGroupReq):
+    def scaling_up_intra_node_dp_group(self, req: ScaleDpGroupReq):
         # assume initally, we can see all gpus, but only one dp group can serve
         self.dp_groups_flag[self.cur_dp_size] = True
         # done scaling up
         self.cur_dp_size += 1
         self.cur_gpus += self.workers_per_dp
         logger.info(f"Scaling up DP group to {self.cur_dp_size} numbers.")
+    
+    def scaling_down_intra_node_dp_group(self, req: ScaleDpGroupReq):
+        # assume initally, we can see all gpus, but only one dp group can serve
+        self.dp_groups_flag[self.cur_dp_size - 1] = False
+        # done scaling up
+        self.cur_dp_size -= 1
+        self.cur_gpus -= self.workers_per_dp
+        # control reqs
+        cur_worker_running_flag = [
+            True if i < self.cur_gpus else False for i in range(self.server_args.tp_size)]
+        logger.info(f"Controller: cur_dp_size: {self.cur_dp_size}, cur_gpus: {self.cur_gpus}, cur_worker_running_flag: {cur_worker_running_flag}")
+        self.workers[0].send_pyobj(UpdateCurRangeReqInput(cur_range=self.cur_dp_size - 1,
+            cur_worker_running_flag=cur_worker_running_flag))
+        
+        logger.info(f"Scaling down DP group to {self.cur_dp_size} numbers.")
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
         self.launch_tensor_parallel_group(server_args, port_args, 0, None)
@@ -233,12 +244,6 @@ class DataParallelController:
             tp_size_per_node * server_args.node_rank,
             tp_size_per_node * (server_args.node_rank + 1),
         )
-        # if scaling is True:
-        #     # tp_size is the minimum scaling unit
-        #     tp_size_per_node = min(
-        #         (server_args.tp_size + self.cur_gpus), server_args.gpus_per_node
-        #     )
-        #     tp_rank_range = range(self.cur_gpus, self.cur_gpus + server_args.tp_size)
 
         for tp_rank in tp_rank_range:
             rank_port_args = port_args
@@ -294,6 +299,9 @@ class DataParallelController:
                 self.workers
             )
         elif self.server_args.enable_scaling:
+            logger.info(
+                    f"Cache-aware scheduler: sending request to worker {self.round_robin_counter}, self.cur_dp_size: {self.cur_dp_size}, dp_groups_flag: {self.dp_groups_flag}"
+            )
             self.workers[self.round_robin_counter].send_pyobj(req)
             self.round_robin_counter = (self.round_robin_counter + 1) % self.cur_dp_size
         else:
@@ -318,6 +326,9 @@ class DataParallelController:
 
         for i in range(len(self.workers)):
             if self.dp_groups_flag[i]:
+                logger.info(
+                    f"Cache-aware scheduler: sending request to worker {i}"
+                )
                 self.workers[i].send_pyobj(CacheAwareInfoInput(token_ids=req.input_ids))
 
         # receive the prefix length from each scheduler
@@ -391,9 +402,22 @@ class DataParallelController:
                 ):
                     self.dispatching(recv_req)
 
-                elif isinstance(recv_req, ScaleUpDpGroupReq):
+                elif isinstance(recv_req, ScaleDpGroupReq):
                     # scaling up dp group
-                    self.scaling_up_intra_node_dp_group(recv_req)
+                    if recv_req.is_up:
+                        if self.cur_dp_size < self.server_args.dp_size:
+                            self.scaling_up_intra_node_dp_group(recv_req)
+                        else:
+                            logger.warning(
+                                "Cannot scale up DP group, already at max DP size."
+                            )
+                    else:
+                        if self.cur_dp_size > 1:
+                            self.scaling_down_intra_node_dp_group(recv_req)
+                        else:
+                            logger.warning(
+                                "Cannot scale down DP group, already at min DP size."
+                            )
                 else:
                     # Send other control messages to first worker of tp group
                     for worker in self.workers[:: self.control_message_step]:

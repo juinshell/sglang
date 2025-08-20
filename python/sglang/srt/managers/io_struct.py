@@ -945,9 +945,19 @@ class RpcReqOutput:
 
 
 @dataclass
-class ScaleUpDpGroupReq:
-    pass
+class ScaleDpGroupReq:
+    is_up: bool
 
+
+# for scheduler input
+@dataclass
+class ScaleDownDpGroupReqInput:
+    cur_range: int
+
+@dataclass
+class UpdateCurRangeReqInput:
+    cur_range: int
+    cur_worker_running_flag: List[bool]
 
 @dataclass
 class CacheAwareInfoInput:

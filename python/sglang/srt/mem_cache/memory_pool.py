@@ -55,14 +55,14 @@ class ReqToTokenPool:
         device: str,
         enable_memory_saver: bool,
     ):
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region():
+        with self.memory_saver_adapter.region():
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
@@ -91,7 +91,10 @@ class ReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(self.size))
-
+    
+    def pause(self):
+        self.memory_saver_adapter.pause()
+        
 
 class KVCache(abc.ABC):
 
@@ -498,11 +501,11 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
 
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
-        with memory_saver_adapter.region():
+        with self.memory_saver_adapter.region():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.kv_buffer = [
                 torch.zeros(
@@ -606,6 +609,9 @@ class MLATokenToKVPool(KVCache):
         # transfer prepared data from host to device
         flat_data = flat_data.to(device=self.device, non_blocking=False)
         self.kv_buffer[layer_id][indices] = flat_data
+        
+    def pause(self):
+        self.memory_saver_adapter.pause()
 
 
 class DoubleSparseTokenToKVPool(KVCache):
